@@ -729,6 +729,98 @@ Dọn stack: `docker compose -p k5-day14-scaling down`.
 
 ---
 
+## Part 6: Final Project
+
+Code trong `06-lab-complete/`. Chạy đầy đủ (có Docker 29.9.3, Python 3.11) `python check_production_ready.py`:
+
+```text
+================================================================
+  📋 Checklist Deliverable
+     ✅ Dockerfile (multi-stage, < 500 MB)
+     ✅ docker-compose.yml (agent + redis)
+     ✅ .dockerignore
+     ✅ Health check endpoint (GET /health)
+     ✅ Readiness endpoint (GET /ready)
+     ✅ API Key authentication
+     ✅ Rate limiting
+     ✅ Cost guard
+     ✅ Config từ environment variables
+     ✅ Structured logging
+     ✅ Graceful shutdown
+     ✅ Public URL ready (Railway / Render config)
+----------------------------------------------------------------
+  Result: 12/12 tiêu chí đạt · 43/43 checks passed
+  🎉 PASS 12/12 — PRODUCTION READY! Deploy nào!
+================================================================
+```
+
+Chi tiết một số check: image **297 MB**; 429 sau 5 request thành công (`RATE_LIMIT_PER_MINUTE=5`, 2 worker); restart agent vẫn bị 429 (state trong Redis); Redis mất kết nối → `/ready` 503, `/health` 200; 402 ở request thứ 1 khi budget 0.000001 USD; SIGTERM lúc đang có request → request 200, exit code 0; `docker stop` exit code 0 trong 0,5 s.
+
+### Thiết kế
+
+| File | Cách làm |
+|---|---|
+| `app/config.py` | Dataclass đọc mọi cấu hình từ env (`PORT`, `ENVIRONMENT`, `AGENT_API_KEY`, `REDIS_URL`, `RATE_LIMIT_PER_MINUTE`, `DAILY_BUDGET_USD`, `MONTHLY_BUDGET_USD`, `LOG_LEVEL`). `validate()` fail fast: `ENVIRONMENT=production` mà thiếu `AGENT_API_KEY` thì không khởi động. |
+| `app/auth.py` | `APIKeyHeader("X-API-Key", auto_error=False)` để tự trả **401** (thiếu hoặc sai). So sánh bằng `hmac.compare_digest` (chống timing attack). Chưa cấu hình key → từ chối mọi request (fail closed). |
+| `app/redis_client.py` | `redis.from_url(...)` chỉ tạo pool, không kết nối lúc import, nên container khởi động được khi chưa có Redis. Timeout 1 s để `/ready` và `/ask` không treo khi Redis chết. |
+| `app/rate_limiter.py` | Sliding window log trên Redis sorted set (score = timestamp ms), toàn bộ `ZREMRANGEBYSCORE → ZCARD → ZADD → PEXPIRE` chạy trong **một Lua script** nên atomic giữa các worker/instance. Key là SHA-256 của API key (không lưu key rõ). Vượt → **429** + `Retry-After`. |
+| `app/cost_guard.py` | Chi phí ước tính theo token (~4 ký tự/token, giá gpt-4o-mini). Cộng dồn vào Redis theo `cost:daily:YYYY-MM-DD` và `cost:monthly:YYYY-MM` (UTC, có TTL nên tự reset). `check_budget(ước tính)` **trước** khi gọi LLM, `record_cost` **sau** khi gọi. Vượt ngày hoặc tháng → **402**. Budget tính cho toàn agent để bảo vệ hoá đơn. |
+| `app/main.py` | `JsonFormatter` cho mọi log (gồm cả log của uvicorn trong worker); middleware log mỗi request `{event, request_id, method, path, status, ms}` (không log API key hay câu hỏi). `/health` luôn 200; `/ready` 503 khi Redis lỗi hoặc đang shutdown. `/ask` khai báo `def` để chạy trong threadpool (LLM chậm không block event loop). Lỗi Redis → **503** + `Retry-After`; lỗi bất ngờ → **500** `{"detail":"Internal server error"}`, không trả stack trace. `lifespan` đóng Redis pool khi shutdown. |
+| `Dockerfile` | 2 stage: `builder` tạo venv và cài deps; `runtime` `python:3.11-slim` chỉ copy venv + `app/` + `utils/`, user `app` (non-root), `HEALTHCHECK` gọi `/health`. `CMD sh -c "exec uvicorn ... --port ${PORT:-8000} --workers ${WEB_CONCURRENCY:-2} --timeout-graceful-shutdown 8"`: `exec` để uvicorn là PID 1 nhận SIGTERM. |
+| `docker-compose.yml` | `agent` (build, `env_file: .env` với `required: false`, `REDIS_URL=redis://redis:6379/0`, `depends_on: redis: service_healthy`) + `redis:7-alpine` (healthcheck `redis-cli ping`, AOF, volume). |
+| `.dockerignore` | Loại `.env*` (giữ `.env.example`), `__pycache__`, `venv`, `.git`, tài liệu, `benchmark-observability/`, script chấm. |
+| `railway.toml` / `render.yaml` | Railway: `builder = "DOCKERFILE"`, `healthcheckPath = "/health"`. Render: `type: web`, `runtime: docker`, `healthCheckPath: /health`, `AGENT_API_KEY` dùng `generateValue: true`, `REDIS_URL` lấy từ service Key Value. |
+
+### Test thêm bằng tay (`docker compose -p k5-day14-final up -d --build`)
+
+```text
+health: {"status":"ok","version":"1.0.0","environment":"staging","uptime_seconds":0.5}
+ready:  {"status":"ready"}
+
+--- không key:
+HTTP/1.1 401 Unauthorized
+www-authenticate: ApiKey
+{"detail":"Invalid or missing API key"}
+
+--- có key:
+{"question":"What is deployment?","answer":"Deployment là quá trình đưa code từ máy bạn lên server để người khác dùng được.","usage":{"input_tokens":5,"output_tokens":20,"cost_usd":1.275e-05,"requests_remaining":9}}
+
+--- question rỗng:
+HTTP/1.1 422 Unprocessable Entity
+{"detail":[{"type":"string_too_short","loc":["body","question"],"msg":"String should have at least 1 character","input":"","ctx":{"min_length":1}}]}
+
+--- JSON hỏng:
+HTTP/1.1 422 Unprocessable Entity
+{"detail":[{"type":"json_invalid","loc":["body",12],"msg":"JSON decode error","input":{},"ctx":{"error":"Expecting value"}}]}
+
+--- thiếu field: HTTP/1.1 422 · question 2001 ký tự: HTTP 422
+
+--- rate limit (RATE_LIMIT_PER_MINUTE=10; 1 request trước đó + 12 request):
+200 200 200 200 200 200 200 200 200 429 429 429
+HTTP/1.1 429 Too Many Requests
+retry-after: 59
+{"detail":{"error":"Rate limit exceeded","limit_per_minute":10,"retry_after_seconds":59}}
+
+--- tắt Redis khi agent đang chạy:
+health: 200  ready: 503
+HTTP/1.1 503 Service Unavailable
+retry-after: 5
+{"detail":"Service temporarily unavailable"}
+ready sau khi bật lại Redis: 200
+```
+
+Log (mỗi dòng 1 JSON, không có traceback):
+
+```text
+{"ts": "2026-11-25T08:03:42.848+00:00", "lvl": "INFO", "logger": "agent", "msg": "startup", "event": "startup", "version": "1.0.0", "environment": "staging", "port": 8000, "redis_ok": true}
+{"ts": "2026-11-25T08:03:45.215+00:00", "lvl": "INFO", "logger": "agent", "msg": "request", "event": "request", "request_id": "5434767ba3c9401c", "method": "POST", "path": "/ask", "status": 429, "ms": 1.1}
+{"ts": "2026-11-25T08:03:45.522+00:00", "lvl": "ERROR", "logger": "agent", "msg": "redis unavailable", "event": "redis_error", "path": "/ask", "error": "ConnectionError"}
+```
+
+Trong container: `whoami` → `app`; `/app` chỉ có `app/` và `utils/`.
+
+---
+
 ## AI log
 
 | # | Hỏi AI gì | Nhận được gì | Tự sửa / tự kiểm tra thế nào |
@@ -738,3 +830,4 @@ Dọn stack: `docker compose -p k5-day14-scaling down`.
 | 3 | (Claude Code) Làm CP2: build 2 image, chạy container, bật stack Compose, soạn câu trả lời Part 2 | Lệnh build/run/test, số đo kích thước image, sơ đồ kiến trúc, giải thích multi-stage | Số MB lấy từ `docker images` / `docker image inspect` chạy trên máy mình; tự tính lại % chênh lệch; đọc lại `Dockerfile`, `docker-compose.yml`, `nginx.conf` để đối chiếu sơ đồ |
 | 4 | (Claude Code) Làm CP3: chạy Part 4 develop/production, vòng lặp rate limit, viết `check_budget` dùng Redis | Output `curl -i` 401/403/200/429, giải thích JWT flow và sliding window, code cost guard Redis + script test | Output curl là từ máy mình (đã che token); tự chạy test cost guard với Redis thật (kể cả 200 request song song); tự kiểm lại vì sao dùng `INCRBYFLOAT` trước rồi hoàn lại thay vì `GET` rồi `INCR` |
 | 5 | (Claude Code) Làm CP4: test health/ready, SIGTERM khi đang có request, stack 3 agent + Nginx, `test_stateless.py`, tắt 1 instance | Lệnh test, output, giải thích liveness/readiness, graceful shutdown, round-robin và failover; các quan sát (event loop bị block, thứ tự signal handler, race trong `append_to_history`) | Output là từ máy mình; tự đối chiếu `served_by` với log từng container để ánh xạ instance id ↔ container; tự kiểm lại vì sao 2 request mất 6 s |
+| 6 | (Claude Code) Làm CP5: đọc `check_production_ready.py` để hiểu từng check, viết code cho các TODO trong `06-lab-complete/` (config, auth, redis client, rate limiter Lua, cost guard, log JSON, lifespan, Dockerfile, compose, .dockerignore, .env.example, railway.toml, render.yaml) | Toàn bộ code Part 6 + test tay qua docker compose | Chạy `check_production_ready.py` bản đầy đủ trên máy mình → PASS 12/12; tự test thêm 401/422/429/503 và tắt Redis giữa chừng; tự đọc lại từng file để giải thích được (Lua script atomic, vì sao `/health` không check Redis, vì sao `exec` trong CMD) |
